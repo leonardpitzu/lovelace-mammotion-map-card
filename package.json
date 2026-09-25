@@ -1,0 +1,35 @@
+{
+  "name": "lovelace-mammotion-map-card",
+  "version": "2026.09.1",
+  "description": "Vacuum-style zone map for Mammotion mowers in a Home Assistant Lovelace card.",
+  "type": "module",
+  "main": "dist/mammotion-map-card.js",
+  "scripts": {
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "tsc --noEmit",
+    "build": "rollup -c"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leonardpitzu/lovelace-mammotion-map-card.git"
+  },
+  "bugs": {
+    "url": "https://github.com/leonardpitzu/lovelace-mammotion-map-card/issues"
+  },
+  "homepage": "https://github.com/leonardpitzu/lovelace-mammotion-map-card#readme",
+  "author": "Leonard Pitzu",
+  "license": "MIT",
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@rollup/plugin-terser": "^1.0.0",
+    "@rollup/plugin-typescript": "^12.3.0",
+    "@stylistic/eslint-plugin": "^5.10.0",
+    "eslint": "^10.8.0",
+    "globals": "^17.8.0",
+    "rollup": "^4.62.3",
+    "tslib": "^2.8.1",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.65.0"
+  }
+}

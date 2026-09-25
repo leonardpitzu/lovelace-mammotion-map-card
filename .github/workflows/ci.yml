@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore: ["**.md", ".gitignore", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", ".gitignore", "LICENSE"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Lint, typecheck & build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          check-latest: true
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Check for errors
+        run: npm run lint
+      - name: Check types
+        run: npm run typecheck
+      - name: Build bundle
+        run: npm run build
+      # dist/ is the artifact HACS serves, so an empty or missing bundle has to
+      # fail here rather than at a user's dashboard.
+      - name: Verify bundle
+        run: test -s dist/mammotion-map-card.js
+      - name: Upload bundle
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mammotion-map-card
+          path: dist/mammotion-map-card.js
+          if-no-files-found: error
+          retention-days: 14
+
+  hacs:
+    name: Validate (HACS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hacs/action@main
+        with:
+          category: plugin

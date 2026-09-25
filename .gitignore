@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build caches (dist/ is the HACS-distributed artifact - keep it tracked)
+.cache/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor junk
+.DS_Store
+.idea/
+*.swp
+
+# Local-only: agent notes and throwaway probe scripts, never published
+AGENTS.md
+tools/
