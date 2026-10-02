@@ -17,7 +17,7 @@ const ACTIVE_STATES = ["mowing", "paused", "returning"];
 // Tracker fixes further apart than this are not joined: outside the 5-minute
 // report stream the tracker updates every few minutes, and a straight line
 // across the lawn between two such fixes would be fiction.
-const TRAIL_GAP_S = 20;
+const TRAIL_GAP_S = 45;
 const TRAIL_LOOKBACK_H = 24;
 
 // The integration blips mowing -> docked -> mowing within milliseconds; only

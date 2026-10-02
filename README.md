@@ -114,7 +114,7 @@ Each call costs the mower a few cloud round-trips, which is why the interval flo
 
 A job starts on the first `mowing` after the mower has been idle for over a minute;
 the trail resets there and the last job's trail stays on the map until then.
-Tracker fixes more than 20 s apart are not joined.  Hide the route by type with
+Tracker fixes more than 45 s apart are not joined.  Hide the route by type with
 `hide_types: [mow_path, border_pass]`.
 
 ## Credits
