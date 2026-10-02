@@ -21,6 +21,8 @@ offered - fork it or install it by hand.
 |---|---|
 | Zone rendering | Mowing areas, obstacles and connecting paths, using the colours, weights and opacities the integration supplies per feature |
 | Mow progress | The mown path from `mammotion.get_mow_progress_geojson`, refreshed on a timer that **survives a failed poll** instead of cancelling itself |
+| Mown trail | The ground actually covered this job, blade-width wide, rebuilt from the recorder on page load so a reload mid-job does not start from a blank lawn |
+| Planned route | The stripes and border passes the mower plans to drive, as hairlines under the trail |
 | Live mower | Position and heading from the mower's `device_tracker`, drawn as a rotating arrow, with a GPS-accuracy halo when the mower reports one |
 | Feature hiding | Drop features by `type_name` or by name - the escape hatch for NetRTK models, which report a phantom `RTK Base` sitting on top of the dock |
 | Auto framing | Bounds are recomputed from the data on every render, so the plot fills the card and the mower is never clipped if it strays outside the mapped zones |
@@ -90,7 +92,30 @@ Mowers with a real RTK antenna should leave it visible.
 | `show_labels` | boolean | `true` | Draw zone names and their area in m². |
 | `show_progress` | boolean | `true` | Draw the mown path.  Disabling it also stops the progress service call. |
 | `progress_interval` | number | `180` | Seconds between progress refreshes.  Clamped to a minimum of 30.  Static geometry is re-fetched every 10th tick. |
+| `show_route` | boolean | `true` | Draw the planned route from `mammotion.get_mow_path_geojson`.  Only exists while a job runs. |
+| `show_trail` | boolean | `true` | Draw the mown trail.  Needs `tracker`. |
+| `trail_width` | number | `0.22` | Trail width in metres - your mower's cutting width. |
 | `padding` | number | `18` | Pixels of breathing room between the plot and the card edge. |
+
+## Where the path comes from
+
+The integration has three sources, none of them complete on its own, so the card
+stitches them together:
+
+| Source | What it is | Cadence | Catch |
+|---|---|---|---|
+| `device_tracker` | Mower position | ~5 s while the report stream runs, minutes otherwise | The stream lasts 5 minutes; `get_geojson` re-arms it, so the card calls it every tick during a job |
+| `get_mow_progress_geojson` | On dynamics-line models: a gold `LineString` of the last few metres cut, ~10 cm point spacing | Over BLE every 10 s; over the cloud only when `fetch_mow_path` is called | It is a rolling window, not the job so far - the card keeps every window it sees |
+| `get_mow_path_geojson` | Planned route: `mow_path` stripes and `border_pass` laps | Fetched once per route by `fetch_mow_path` | Needs **Enable mow path fetching (cloud)** in the integration options when not on BLE, and the multi-frame fetch can time out over the cloud |
+
+During a job the card calls `mammotion.fetch_mow_path` once per `progress_interval`.
+Each call costs the mower a few cloud round-trips, which is why the interval floor is
+30 s and the default 180 s.
+
+A job starts on the first `mowing` after the mower has been idle for over a minute;
+the trail resets there and the last job's trail stays on the map until then.
+Tracker fixes more than 20 s apart are not joined.  Hide the route by type with
+`hide_types: [mow_path, border_pass]`.
 
 ## Credits
 

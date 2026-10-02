@@ -10,7 +10,36 @@ const M_PER_DEG_LON = 111320;
 const STATIC_EVERY = 10;
 const MIN_INTERVAL_S = 30;
 
+// Lawn-mower states that belong to a running job.  A job starts on the first
+// "mowing" that follows any other state; the trail is reset there.
+const ACTIVE_STATES = ["mowing", "paused", "returning"];
+
+// Tracker fixes further apart than this are not joined: outside the 5-minute
+// report stream the tracker updates every few minutes, and a straight line
+// across the lawn between two such fixes would be fiction.
+const TRAIL_GAP_S = 20;
+const TRAIL_LOOKBACK_H = 24;
+
+// The integration blips mowing -> docked -> mowing within milliseconds; only
+// a stop longer than this ends a job.
+const JOB_GAP_S = 60;
+
+const ROUTE_TYPES = ["mow_path", "border_pass"];
+
 type Position = [number, number];
+
+interface Fix {
+    t: number;
+    lon: number;
+    lat: number;
+}
+
+// The recorder's compressed history rows: state, attributes, last_updated (epoch s).
+interface HistoryRow {
+    s: string;
+    a?: Record<string, unknown>;
+    lu: number;
+}
 
 type Geometry =
     | { type: "Point"; coordinates: Position }
@@ -49,6 +78,7 @@ interface FeatureCollection {
 interface HassEntity {
     state: string;
     attributes: Record<string, unknown>;
+    last_updated: string;
 }
 
 interface Hass {
@@ -64,6 +94,9 @@ interface CardConfig {
     hide_names: string[];
     show_labels: boolean;
     show_progress: boolean;
+    show_route: boolean;
+    show_trail: boolean;
+    trail_width: number;
     progress_interval: number;
     padding: number;
 }
@@ -83,6 +116,9 @@ const DEFAULTS: Omit<CardConfig, "entity"> = {
     hide_names: [],
     show_labels: true,
     show_progress: true,
+    show_route: true,
+    show_trail: true,
+    trail_width: 0.22,
     progress_interval: 180,
     padding: 18
 };
@@ -143,6 +179,18 @@ class MammotionMapCard extends HTMLElement {
 
     private staticData: FeatureCollection | null = null;
     private progressData: FeatureCollection | null = null;
+    private routeData: FeatureCollection | null = null;
+
+    // The mown trail: tracker fixes since the job started, plus every
+    // dynamics-line window seen, keyed by its first point.  The integration
+    // only ever hands out the last few metres of the dynamics line.
+    private fixes: Fix[] = [];
+    private dynamics = new Map<string, Position[]>();
+    private trailLoaded = false;
+    private lastFixStamp = "";
+    private lastMowerState: string | null = null;
+    private idleSince: number | null = null;
+
     private ticks = 0;
     private loading = false;
     private lastError: string | null = null;
@@ -161,6 +209,11 @@ class MammotionMapCard extends HTMLElement {
         this.config = { ...DEFAULTS, ...config, entity: config.entity };
         this.staticData = null;
         this.progressData = null;
+        this.routeData = null;
+        this.resetTrail();
+        this.trailLoaded = false;
+        this.lastMowerState = null;
+        this.idleSince = null;
         this.ticks = 0;
         this.lastError = null;
         this.build();
@@ -170,6 +223,7 @@ class MammotionMapCard extends HTMLElement {
         const first = this.hassObj === null;
 
         this.hassObj = hass;
+        this.trackMower();
 
         if (first) {
             this.start();
@@ -241,6 +295,15 @@ class MammotionMapCard extends HTMLElement {
                     stroke-width: 1.5px;
                 }
                 .accuracy { fill: var(--primary-color); opacity: 0.1; }
+                .route {
+                    fill: none; stroke: var(--primary-text-color);
+                    stroke-width: 1px; stroke-opacity: 0.25;
+                    stroke-linecap: round; stroke-linejoin: round;
+                }
+                .trail {
+                    fill: none; stroke: var(--primary-color); opacity: 0.4;
+                    stroke-linecap: round; stroke-linejoin: round;
+                }
             </style>
             <ha-card>
                 <div class="canvas">
@@ -272,6 +335,11 @@ class MammotionMapCard extends HTMLElement {
 
         void this.refresh(true);
 
+        if (!this.trailLoaded) {
+            this.trailLoaded = true;
+            void this.loadTrail();
+        }
+
         const period = Math.max(MIN_INTERVAL_S, num(this.config.progress_interval, 180)) * 1000;
 
         this.timer = setInterval(() => void this.refresh(false), period);
@@ -291,7 +359,13 @@ class MammotionMapCard extends HTMLElement {
 
         this.loading = true;
 
-        const wantStatic = force || this.staticData === null || this.ticks % STATIC_EVERY === 0;
+        const active = this.mowerActive();
+
+        // get_geojson also (re)starts the mower's 5-minute report stream,
+        // which drops the tracker from minutes to ~5 s between fixes.  While
+        // a job runs, re-arm it every tick so the trail stays dense.
+        const wantStatic = force || this.staticData === null || this.ticks % STATIC_EVERY === 0 ||
+            (active && this.config.show_trail && this.config.tracker !== null);
 
         this.ticks += 1;
 
@@ -304,11 +378,32 @@ class MammotionMapCard extends HTMLElement {
                 }
             }
 
-            if (this.config.show_progress) {
+            // Over the cloud nothing refreshes the dynamics line or fetches the
+            // planned route unless asked.  The reply lands asynchronously and
+            // is picked up by the next tick.
+            if (active && (this.config.show_route || this.config.show_progress || this.config.show_trail)) {
+                await this.hassObj.callWS({
+                    type: "call_service",
+                    domain: "mammotion",
+                    service: "fetch_mow_path",
+                    service_data: { entity_id: this.config.entity }
+                }).catch((error: unknown) => console.debug("[mammotion-map-card] fetch_mow_path failed:", error));
+            }
+
+            if (this.config.show_route) {
+                const collection = await this.fetchCollection("get_mow_path_geojson");
+
+                if (collection) {
+                    this.routeData = collection;
+                }
+            }
+
+            if (this.config.show_progress || this.config.show_trail) {
                 const collection = await this.fetchCollection("get_mow_progress_geojson");
 
                 if (collection) {
                     this.progressData = collection;
+                    this.absorbDynamics(collection);
                 }
             }
 
@@ -338,7 +433,183 @@ class MammotionMapCard extends HTMLElement {
         return collection && Array.isArray(collection.features) ? collection : null;
     }
 
-    private visibleFeatures(): { statics: Feature[]; progress: Feature[] } {
+    private mowerActive(): boolean {
+        const state = this.hassObj?.states[this.config.entity]?.state ?? "";
+
+        return ACTIVE_STATES.includes(state);
+    }
+
+    private resetTrail(): void {
+        this.fixes = [];
+        this.dynamics.clear();
+        this.lastFixStamp = "";
+    }
+
+    /** Follows the live entities: resets the trail when a job starts, appends tracker fixes during one. */
+    private trackMower(): void {
+        if (!this.config.show_trail || !this.hassObj) {
+            return;
+        }
+
+        const state = this.hassObj.states[this.config.entity]?.state ?? null;
+        const now = Date.now() / 1000;
+
+        if (state !== this.lastMowerState) {
+            if (!ACTIVE_STATES.includes(state ?? "")) {
+                this.idleSince ??= now;
+            } else {
+                if (state === "mowing" && this.idleSince !== null && now - this.idleSince > JOB_GAP_S) {
+                    this.resetTrail();
+                }
+
+                this.idleSince = null;
+            }
+        }
+
+        this.lastMowerState = state;
+
+        if (!this.config.tracker || !ACTIVE_STATES.includes(state ?? "")) {
+            return;
+        }
+
+        const tracker = this.hassObj.states[this.config.tracker];
+
+        if (!tracker || tracker.last_updated === this.lastFixStamp) {
+            return;
+        }
+
+        this.lastFixStamp = tracker.last_updated;
+        this.addFix(Date.parse(tracker.last_updated) / 1000, tracker.attributes);
+    }
+
+    private addFix(t: number, attributes: Record<string, unknown> | undefined): void {
+        const lat = attributes?.latitude;
+        const lon = attributes?.longitude;
+
+        if (typeof lat !== "number" || typeof lon !== "number" || !Number.isFinite(t)) {
+            return;
+        }
+
+        const last = this.fixes[this.fixes.length - 1];
+
+        // The tracker re-reports an unchanged position several times a second
+        // while the stream runs; only movement is kept.
+        if (last && last.lat === lat && last.lon === lon) {
+            last.t = Math.max(last.t, t);
+
+            return;
+        }
+
+        if (last && t < last.t) {
+            return;
+        }
+
+        this.fixes.push({ t, lon, lat });
+    }
+
+    private absorbDynamics(collection: FeatureCollection): void {
+        if (!this.config.show_trail) {
+            return;
+        }
+
+        for (const feature of collection.features) {
+            const geometry = feature.geometry;
+
+            if (feature.properties?.type_name !== "dynamics_line" || geometry?.type !== "LineString") {
+                continue;
+            }
+
+            const line = geometry.coordinates;
+
+            if (line.length < 2) {
+                continue;
+            }
+
+            const key = line[0].join(",");
+            const known = this.dynamics.get(key);
+
+            if (!known || known.length < line.length) {
+                this.dynamics.set(key, line);
+            }
+        }
+    }
+
+    /**
+     * Rebuilds the current (or last) job's trail from the recorder, so a page
+     * reload mid-job does not start from a blank lawn.
+     */
+    private async loadTrail(): Promise<void> {
+        if (!this.config.show_trail || !this.config.tracker || !this.hassObj) {
+            return;
+        }
+
+        const now = Date.now() / 1000;
+        const since = new Date((now - TRAIL_LOOKBACK_H * 3600) * 1000).toISOString();
+
+        try {
+            const mower = await this.hassObj.callWS<Record<string, HistoryRow[] | undefined>>({
+                type: "history/history_during_period",
+                start_time: since,
+                entity_ids: [this.config.entity],
+                minimal_response: true,
+                no_attributes: true,
+                significant_changes_only: false
+            });
+
+            const rows = mower[this.config.entity] ?? [];
+            let start: number | null = null;
+            let end: number | null = null;
+
+            for (let i = 0; i < rows.length; i += 1) {
+                const row = rows[i];
+                const previous = i > 0 ? rows[i - 1] : null;
+                const fresh = previous === null ||
+                    (!ACTIVE_STATES.includes(previous.s) && row.lu - previous.lu > JOB_GAP_S);
+
+                if (row.s === "mowing" && fresh) {
+                    start = row.lu;
+                    end = null;
+                } else if (row.s === "mowing" && previous !== null && !ACTIVE_STATES.includes(previous.s)) {
+                    end = null;
+                } else if (start !== null && end === null && !ACTIVE_STATES.includes(row.s)) {
+                    end = row.lu;
+                }
+            }
+
+            if (start === null) {
+                return;
+            }
+
+            const tracker = await this.hassObj.callWS<Record<string, HistoryRow[] | undefined>>({
+                type: "history/history_during_period",
+                start_time: new Date(start * 1000).toISOString(),
+                end_time: new Date((end ?? now) * 1000).toISOString(),
+                entity_ids: [this.config.tracker],
+                minimal_response: false,
+                no_attributes: false,
+                significant_changes_only: false
+            });
+
+            const live = this.fixes;
+
+            this.fixes = [];
+
+            for (const row of tracker[this.config.tracker] ?? []) {
+                this.addFix(row.lu, row.a);
+            }
+
+            // Fixes that arrived live while the history query was in flight.
+            for (const fix of live) {
+                this.addFix(fix.t, { latitude: fix.lat, longitude: fix.lon });
+            }
+
+            this.render();
+        } catch (error) {
+            console.warn("[mammotion-map-card] trail history unavailable:", error);
+        }
+    }
+
+    private visibleFeatures(): { statics: Feature[]; progress: Feature[]; route: Feature[] } {
         const hiddenTypes = new Set(this.config.hide_types.map((value) => value.toLowerCase()));
         const hiddenNames = new Set(this.config.hide_names.map((value) => value.toLowerCase()));
 
@@ -354,7 +625,12 @@ class MammotionMapCard extends HTMLElement {
 
         return {
             statics: (this.staticData?.features ?? []).filter(keep),
-            progress: this.config.show_progress ? (this.progressData?.features ?? []).filter(keep) : []
+            progress: this.config.show_progress ? (this.progressData?.features ?? []).filter(keep) : [],
+            route: this.config.show_route
+                ? (this.routeData?.features ?? [])
+                    .filter((feature) => ROUTE_TYPES.includes(feature.properties?.type_name ?? ""))
+                    .filter(keep)
+                : []
         };
     }
 
@@ -390,7 +666,7 @@ class MammotionMapCard extends HTMLElement {
             return;
         }
 
-        const { statics, progress } = this.visibleFeatures();
+        const { statics, progress, route } = this.visibleFeatures();
         const mower = this.mowerFix();
 
         if (statics.length === 0 && progress.length === 0) {
@@ -457,9 +733,19 @@ class MammotionMapCard extends HTMLElement {
         const ofType = (type: string): Feature[] =>
             statics.filter((feature) => (feature.properties?.type_name ?? "") === type);
 
-        const parts: string[] = [];
+        // Route and trail stay out of the bounds: they live inside the zones,
+        // and one stray GPS fix must not reframe the whole map.
+        const parts: string[] = ofType("area").map((feature) => this.drawFeature(feature, toX, toY));
+
+        for (const feature of route) {
+            parts.push(this.drawRoute(feature, toX, toY));
+        }
+
+        if (this.config.show_trail) {
+            parts.push(this.drawTrail(toX, toY, scale));
+        }
+
         const ordered = [
-            ...ofType("area"),
             ...progress,
             ...ofType("path"),
             ...ofType("obstacle"),
@@ -534,6 +820,58 @@ class MammotionMapCard extends HTMLElement {
         }
 
         return "";
+    }
+
+    /** The planned route: hairline stripes, themed rather than the integration's green. */
+    private drawRoute(feature: Feature, toX: (lon: number) => number, toY: (lat: number) => number): string {
+        const geometry = feature.geometry;
+
+        if (geometry?.type !== "LineString" && geometry?.type !== "MultiLineString") {
+            return "";
+        }
+
+        const lines = geometry.type === "LineString" ? [geometry.coordinates] : geometry.coordinates;
+        const d = lines
+            .map((line) => line.map(([lon, lat], i) => `${i ? "L" : "M"}${toX(lon).toFixed(1)},${toY(lat).toFixed(1)}`).join(""))
+            .join("");
+
+        return `<path class="route" d="${d}"/>`;
+    }
+
+    /**
+     * The mown trail as one stroked path, blade-width wide.  A single element
+     * keeps overlapping passes from darkening each other, so it reads as
+     * "cut area" rather than a scribble.
+     */
+    private drawTrail(toX: (lon: number) => number, toY: (lat: number) => number, scale: number): string {
+        const runs: Position[][] = [...this.dynamics.values()];
+        let run: Position[] = [];
+        let lastT = -Infinity;
+
+        for (const fix of this.fixes) {
+            if (fix.t - lastT > TRAIL_GAP_S) {
+                runs.push(run);
+                run = [];
+            }
+
+            run.push([fix.lon, fix.lat]);
+            lastT = fix.t;
+        }
+
+        runs.push(run);
+
+        const d = runs
+            .filter((line) => line.length > 1)
+            .map((line) => line.map(([lon, lat], i) => `${i ? "L" : "M"}${toX(lon).toFixed(1)},${toY(lat).toFixed(1)}`).join(""))
+            .join("");
+
+        if (!d) {
+            return "";
+        }
+
+        const width = Math.max(2, num(this.config.trail_width, 0.22) * scale);
+
+        return `<path class="trail" d="${d}" stroke-width="${width.toFixed(1)}"/>`;
     }
 
     private drawStation(feature: Feature, toX: (lon: number) => number, toY: (lat: number) => number): string {
