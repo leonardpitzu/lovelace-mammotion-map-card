@@ -1,6 +1,6 @@
 {
   "name": "lovelace-mammotion-map-card",
-  "version": "2026.09.1",
+  "version": "2026.10.0",
   "description": "Vacuum-style zone map for Mammotion mowers in a Home Assistant Lovelace card.",
   "type": "module",
   "main": "dist/mammotion-map-card.js",
