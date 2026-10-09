@@ -20,7 +20,7 @@ offered - fork it or install it by hand.
 | Feature | Description |
 |---|---|
 | Zone rendering | Mowing areas, obstacles and connecting paths, using the colours, weights and opacities the integration supplies per feature |
-| Mow progress | The mown path from `mammotion.get_mow_progress_geojson`, refreshed on a timer that **survives a failed poll** instead of cancelling itself |
+| Mow progress | From `mammotion.get_mow_progress_geojson` - the mown path on lidar models, the remaining route on others - refreshed on a timer that **survives a failed poll** instead of cancelling itself |
 | Mown trail | The ground actually covered this job, blade-width wide, rebuilt from the recorder on page load so a reload mid-job does not start from a blank lawn |
 | Planned route | The stripes and border passes the mower plans to drive, as hairlines under the trail |
 | Live mower | Position and heading from the mower's `device_tracker`, drawn as a rotating arrow, with a GPS-accuracy halo when the mower reports one |
@@ -105,7 +105,7 @@ stitches them together:
 | Source | What it is | Cadence | Catch |
 |---|---|---|---|
 | `device_tracker` | Mower position | ~5 s while the report stream runs, minutes otherwise | The stream lasts 5 minutes; `get_geojson` re-arms it, so the card calls it every tick during a job |
-| `get_mow_progress_geojson` | On dynamics-line models: a gold `LineString` of the last few metres cut, ~10 cm point spacing | Over BLE every 10 s; over the cloud only when `fetch_mow_path` is called | It is a rolling window, not the job so far - the card keeps every window it sees |
+| `get_mow_progress_geojson` | On dynamics-line models: a gold `LineString` of the **full current-session** cut path | Over BLE every 10 s; over the cloud every 60 s inside a 5-minute window each progress call re-arms | On other models it is instead the *remaining* planned route, not the mown path |
 | `get_mow_path_geojson` | Planned route: `mow_path` stripes and `border_pass` laps | Fetched once per route by `fetch_mow_path` | Needs **Enable mow path fetching (cloud)** in the integration options when not on BLE, and the multi-frame fetch can time out over the cloud |
 
 During a job the card calls `mammotion.fetch_mow_path` once per `progress_interval`.

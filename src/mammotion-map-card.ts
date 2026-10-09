@@ -181,11 +181,12 @@ class MammotionMapCard extends HTMLElement {
     private progressData: FeatureCollection | null = null;
     private routeData: FeatureCollection | null = null;
 
-    // The mown trail: tracker fixes since the job started, plus every
-    // dynamics-line window seen, keyed by its first point.  The integration
-    // only ever hands out the last few metres of the dynamics line.
+    // The mown trail: tracker fixes since the job started, plus the live
+    // dynamics line.  The integration now assembles and hands out the full
+    // current-session cut path on every poll, so the latest line replaces the
+    // last rather than being stitched from rolling windows.
     private fixes: Fix[] = [];
-    private dynamics = new Map<string, Position[]>();
+    private dynamicsLine: Position[] = [];
     private trailLoaded = false;
     private lastFixStamp = "";
     private lastMowerState: string | null = null;
@@ -378,9 +379,9 @@ class MammotionMapCard extends HTMLElement {
                 }
             }
 
-            // Over the cloud nothing refreshes the dynamics line or fetches the
-            // planned route unless asked.  The reply lands asynchronously and
-            // is picked up by the next tick.
+            // fetch_mow_path seeds the planned route (its cover path); the
+            // get_mow_progress_geojson call below re-arms the dynamics-line
+            // cloud window on its own.  Replies land async, picked up next tick.
             if (active && (this.config.show_route || this.config.show_progress || this.config.show_trail)) {
                 await this.hassObj.callWS({
                     type: "call_service",
@@ -441,7 +442,7 @@ class MammotionMapCard extends HTMLElement {
 
     private resetTrail(): void {
         this.fixes = [];
-        this.dynamics.clear();
+        this.dynamicsLine = [];
         this.lastFixStamp = "";
     }
 
@@ -512,6 +513,8 @@ class MammotionMapCard extends HTMLElement {
             return;
         }
 
+        // 0 or 1 dynamics_line feature per poll, carrying the whole cut path so
+        // far.  Keep the longest seen this job; resetTrail clears it on the next.
         for (const feature of collection.features) {
             const geometry = feature.geometry;
 
@@ -519,17 +522,8 @@ class MammotionMapCard extends HTMLElement {
                 continue;
             }
 
-            const line = geometry.coordinates;
-
-            if (line.length < 2) {
-                continue;
-            }
-
-            const key = line[0].join(",");
-            const known = this.dynamics.get(key);
-
-            if (!known || known.length < line.length) {
-                this.dynamics.set(key, line);
+            if (geometry.coordinates.length >= Math.max(2, this.dynamicsLine.length)) {
+                this.dynamicsLine = geometry.coordinates;
             }
         }
     }
@@ -625,7 +619,13 @@ class MammotionMapCard extends HTMLElement {
 
         return {
             statics: (this.staticData?.features ?? []).filter(keep),
-            progress: this.config.show_progress ? (this.progressData?.features ?? []).filter(keep) : [],
+            // dynamics_line is the mown path; the trail draws it, so it is not
+            // also drawn here as a plain feature.
+            progress: this.config.show_progress
+                ? (this.progressData?.features ?? [])
+                    .filter((feature) => feature.properties?.type_name !== "dynamics_line")
+                    .filter(keep)
+                : [],
             route: this.config.show_route
                 ? (this.routeData?.features ?? [])
                     .filter((feature) => ROUTE_TYPES.includes(feature.properties?.type_name ?? ""))
@@ -844,7 +844,7 @@ class MammotionMapCard extends HTMLElement {
      * "cut area" rather than a scribble.
      */
     private drawTrail(toX: (lon: number) => number, toY: (lat: number) => number, scale: number): string {
-        const runs: Position[][] = [...this.dynamics.values()];
+        const runs: Position[][] = this.dynamicsLine.length > 1 ? [this.dynamicsLine] : [];
         let run: Position[] = [];
         let lastT = -Infinity;
 
