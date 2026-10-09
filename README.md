@@ -91,7 +91,7 @@ Mowers with a real RTK antenna should leave it visible.
 | `hide_names` | list | `[]` | Hide features by name, e.g. `RTK Base`. |
 | `show_labels` | boolean | `true` | Draw zone names and their area in m². |
 | `show_progress` | boolean | `true` | Draw the mown path.  Disabling it also stops the progress service call. |
-| `progress_interval` | number | `180` | Seconds between progress refreshes.  Clamped to a minimum of 30.  Static geometry is re-fetched every 10th tick. |
+| `progress_interval` | number | `180` | Seconds between the heavy fetches (`fetch_mow_path`, static geometry, planned route).  Clamped to a minimum of 30.  The mown path itself is read every 15 s while a job runs, so a card opened mid-job fills in promptly. |
 | `show_route` | boolean | `true` | Draw the planned route from `mammotion.get_mow_path_geojson`.  Only exists while a job runs. |
 | `show_trail` | boolean | `true` | Draw the mown trail.  Needs `tracker`. |
 | `trail_width` | number | `0.22` | Trail width in metres - your mower's cutting width. |

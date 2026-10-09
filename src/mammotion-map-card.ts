@@ -6,8 +6,10 @@ declare const __BUILD_ID__: string;
 const M_PER_DEG_LAT = 110574;
 const M_PER_DEG_LON = 111320;
 
-// Static geometry is re-fetched every Nth progress tick; zones change rarely.
-const STATIC_EVERY = 10;
+// The mown path is read on this fast cadence while a job runs, so a card opened
+// mid-job fills in the whole path within seconds.  The heavier fetch/static
+// calls stay on the configured, slower progress_interval.
+const READ_INTERVAL_S = 15;
 const MIN_INTERVAL_S = 30;
 
 // Lawn-mower states that belong to a running job.  A job starts on the first
@@ -192,7 +194,8 @@ class MammotionMapCard extends HTMLElement {
     private lastMowerState: string | null = null;
     private idleSince: number | null = null;
 
-    private ticks = 0;
+    private lastHeavy = 0;
+    private wasActive = false;
     private loading = false;
     private lastError: string | null = null;
     private timer: ReturnType<typeof setInterval> | null = null;
@@ -215,7 +218,8 @@ class MammotionMapCard extends HTMLElement {
         this.trailLoaded = false;
         this.lastMowerState = null;
         this.idleSince = null;
-        this.ticks = 0;
+        this.lastHeavy = 0;
+        this.wasActive = false;
         this.lastError = null;
         this.build();
     }
@@ -341,9 +345,7 @@ class MammotionMapCard extends HTMLElement {
             void this.loadTrail();
         }
 
-        const period = Math.max(MIN_INTERVAL_S, num(this.config.progress_interval, 180)) * 1000;
-
-        this.timer = setInterval(() => void this.refresh(false), period);
+        this.timer = setInterval(() => void this.refresh(false), READ_INTERVAL_S * 1000);
     }
 
     private stop(): void {
@@ -358,53 +360,65 @@ class MammotionMapCard extends HTMLElement {
             return;
         }
 
+        const active = this.mowerActive();
+        const becameActive = active && !this.wasActive;
+        const now = Date.now();
+        const heavyPeriod = Math.max(MIN_INTERVAL_S, num(this.config.progress_interval, 180)) * 1000;
+
+        // The heavy calls (static geometry, fetch_mow_path, planned route) run on
+        // progress_interval; the mown path is read every tick while a job runs.
+        // A job starting re-fetches at once so the path shows without the wait.
+        const heavy = force || becameActive || this.staticData === null || now - this.lastHeavy >= heavyPeriod;
+
+        this.wasActive = active;
+
+        // Idle with nothing heavy due: the mower marker still re-renders on every
+        // hass update, so skip the poll rather than churn the SVG on the fast tick.
+        if (!heavy && !active) {
+            return;
+        }
+
         this.loading = true;
 
-        const active = this.mowerActive();
-
-        // get_geojson also (re)starts the mower's 5-minute report stream,
-        // which drops the tracker from minutes to ~5 s between fixes.  While
-        // a job runs, re-arm it every tick so the trail stays dense.
-        const wantStatic = force || this.staticData === null || this.ticks % STATIC_EVERY === 0 ||
-            (active && this.config.show_trail && this.config.tracker !== null);
-
-        this.ticks += 1;
-
         try {
-            if (wantStatic) {
-                const collection = await this.fetchCollection("get_geojson");
+            if (heavy) {
+                this.lastHeavy = now;
 
-                if (collection) {
-                    this.staticData = collection;
+                // get_geojson also (re)starts the mower's 5-minute report stream,
+                // which drops the tracker from minutes to ~5 s between fixes.
+                const statics = await this.fetchCollection("get_geojson");
+
+                if (statics) {
+                    this.staticData = statics;
+                }
+
+                // fetch_mow_path actively pulls the full current-session cut path
+                // (the device holds it) and seeds the planned route.  Replies land
+                // async and are picked up by the fast read below / on later ticks.
+                if (active && (this.config.show_route || this.config.show_progress || this.config.show_trail)) {
+                    await this.hassObj.callWS({
+                        type: "call_service",
+                        domain: "mammotion",
+                        service: "fetch_mow_path",
+                        service_data: { entity_id: this.config.entity }
+                    }).catch((error: unknown) => console.debug("[mammotion-map-card] fetch_mow_path failed:", error));
+                }
+
+                if (this.config.show_route) {
+                    const route = await this.fetchCollection("get_mow_path_geojson");
+
+                    if (route) {
+                        this.routeData = route;
+                    }
                 }
             }
 
-            // fetch_mow_path seeds the planned route (its cover path); the
-            // get_mow_progress_geojson call below re-arms the dynamics-line
-            // cloud window on its own.  Replies land async, picked up next tick.
-            if (active && (this.config.show_route || this.config.show_progress || this.config.show_trail)) {
-                await this.hassObj.callWS({
-                    type: "call_service",
-                    domain: "mammotion",
-                    service: "fetch_mow_path",
-                    service_data: { entity_id: this.config.entity }
-                }).catch((error: unknown) => console.debug("[mammotion-map-card] fetch_mow_path failed:", error));
-            }
+            if ((active || force) && (this.config.show_progress || this.config.show_trail)) {
+                const progress = await this.fetchCollection("get_mow_progress_geojson");
 
-            if (this.config.show_route) {
-                const collection = await this.fetchCollection("get_mow_path_geojson");
-
-                if (collection) {
-                    this.routeData = collection;
-                }
-            }
-
-            if (this.config.show_progress || this.config.show_trail) {
-                const collection = await this.fetchCollection("get_mow_progress_geojson");
-
-                if (collection) {
-                    this.progressData = collection;
-                    this.absorbDynamics(collection);
+                if (progress) {
+                    this.progressData = progress;
+                    this.absorbDynamics(progress);
                 }
             }
 
